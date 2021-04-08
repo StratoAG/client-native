@@ -31,8 +31,9 @@ import (
 	parser "github.com/haproxytech/config-parser/v3"
 	parser_errors "github.com/haproxytech/config-parser/v3/errors"
 	spoe "github.com/haproxytech/config-parser/v3/spoe"
-	"github.com/haproxytech/models/v2"
 	shellquote "github.com/kballard/go-shellquote"
+
+	"github.com/haproxytech/client-native/v2/models"
 )
 
 type TransactionClient interface {
@@ -48,6 +49,10 @@ type TransactionClient interface {
 	GetFailedParserTransactionVersion(transactionID string) (int64, error)
 	CheckTransactionOrVersion(transactionID string, version int64) (string, error)
 }
+
+// transactionCleanerHandler is just a type dealing with a transaction file:
+// actually implemented moving to the `failed` or `outdated` folder.
+type transactionCleanerHandler func(transactionId, configurationFile string)
 
 type Transaction struct {
 	mu sync.Mutex
@@ -73,7 +78,7 @@ func (t *Transaction) GetTransaction(transactionID string) (*models.Transaction,
 	}
 	v, _ := t.TransactionClient.GetVersion(transactionID)
 
-	return &models.Transaction{ID: transactionID, Status: "in_progress", Version: v}, nil
+	return &models.Transaction{ID: transactionID, Status: models.TransactionStatusInProgress, Version: v}, nil
 }
 
 // StartTransaction starts a new empty lbctl transaction
@@ -105,7 +110,7 @@ func (t *Transaction) startTransaction(version int64, skipVersion bool) (*models
 	}
 
 	m.Version = version
-	m.Status = "in_progress"
+	m.Status = models.TransactionStatusInProgress
 
 	if err := t.TransactionClient.AddParser(m.ID); err != nil {
 		if t.PersistentTransactions {
@@ -140,7 +145,7 @@ func (t *Transaction) commitTransaction(transactionID string, skipVersion bool) 
 
 	if !skipVersion {
 		if tVersion != version {
-			t.failTransaction(transactionID)
+			t.failTransaction(transactionID, t.writeOutdatedTransaction)
 			return nil, NewConfError(ErrVersionMismatch, fmt.Sprintf("version mismatch, transaction version: %v, configured version: %v", tVersion, version))
 		}
 	}
@@ -161,7 +166,7 @@ func (t *Transaction) commitTransaction(transactionID string, skipVersion bool) 
 	// save to transaction file if transactions are not persistent
 	if !t.PersistentTransactions {
 		if err := t.TransactionClient.Save(transactionFile, transactionID); err != nil {
-			t.failTransaction(transactionID)
+			t.failTransaction(transactionID, t.writeFailedTransaction)
 			return nil, NewConfError(ErrErrorChangingConfig, err.Error())
 		}
 	}
@@ -173,19 +178,20 @@ func (t *Transaction) commitTransaction(transactionID string, skipVersion bool) 
 	}
 
 	if err := t.checkTransactionFile(transactionID); err != nil {
-		t.failTransaction(transactionID)
+		t.failTransaction(transactionID, t.writeFailedTransaction)
 		return nil, err
 	}
 
 	// Fail backing up and cleaning backups silently
 	if t.BackupsNumber > 0 {
-		_ = t.TransactionClient.Save(t.ConfigurationFile, "")
+		backupConfFile := fmt.Sprintf("%v.%v", t.ConfigurationFile, strconv.Itoa(int(version)))
+		_ = t.TransactionClient.Save(backupConfFile, "")
 		backupToDel := fmt.Sprintf("%v.%v", t.ConfigurationFile, strconv.Itoa(int(version)-t.BackupsNumber))
 		os.Remove(backupToDel)
 	}
 
 	if err := t.TransactionClient.Save(t.ConfigurationFile, transactionID); err != nil {
-		t.failTransaction(transactionID)
+		t.failTransaction(transactionID, t.writeFailedTransaction)
 		return nil, err
 	}
 
@@ -324,6 +330,38 @@ func (t *Transaction) parseHAProxyCheckError(output []byte, id string) string { 
 	return strings.TrimSuffix(b.String(), "\n")
 }
 
+// MarkTransactionOutdated is marking the transaction by ID as outdated due to a newer commit,
+// moving it to the `outdated` folder, as well cleaning from the current parsers.
+func (t *Transaction) MarkTransactionOutdated(transactionID string) (err error) {
+	// check if parser exists and if transaction exists
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// retrieving current version
+	var version int64
+	version, err = t.TransactionClient.GetVersion("")
+	if err != nil {
+		return err
+	}
+	// retrieving transaction version: needed for comparison
+	var tVersion int64
+	tVersion, err = t.TransactionClient.GetVersion(transactionID)
+	if err != nil {
+		return err
+	}
+
+	switch {
+	case tVersion > version:
+		return fmt.Errorf("transaction %s version (%d) is greater than the current (%d) (are you back from the future?)", transactionID, tVersion, version)
+	case tVersion == version:
+		return fmt.Errorf("transaction %s version is in even with the current one (%d), rather perform deletion", transactionID, version)
+	}
+
+	t.failTransaction(transactionID, t.writeOutdatedTransaction)
+
+	return nil
+}
+
 // DeleteTransaction deletes a transaction by id.
 func (t *Transaction) DeleteTransaction(transactionID string) error {
 	if transactionID == "" {
@@ -360,29 +398,50 @@ func (t *Transaction) parseTransactions(status string) (*models.Transactions, er
 	if err != nil {
 		return nil, err
 	}
+
+	readDirAndAppend := func(f os.FileInfo) error {
+		var ffiles []os.FileInfo
+		ffiles, err = ioutil.ReadDir(filepath.Join(t.TransactionDir, f.Name()))
+		if err != nil {
+			return err
+		}
+		for _, ff := range ffiles {
+			if !ff.IsDir() {
+				if strings.HasPrefix(ff.Name(), confFileName) {
+					transactions = append(transactions, t.parseTransactionFile(filepath.Join(t.TransactionDir, f.Name(), ff.Name())))
+				}
+			}
+		}
+		return nil
+	}
+
 	for _, f := range files {
-		if !f.IsDir() && status != "failed" && t.PersistentTransactions {
+		switch {
+		// regular file
+		case !f.IsDir() && t.PersistentTransactions && (status == "" || status == "in_progress"):
 			if strings.HasPrefix(f.Name(), confFileName) {
 				transactions = append(transactions, t.parseTransactionFile(filepath.Join(t.TransactionDir, f.Name())))
 			}
-		} else {
-			if f.Name() == "failed" && status != "in_progress" {
-				ffiles, err := ioutil.ReadDir(filepath.Join(t.TransactionDir, "failed"))
-				if err != nil {
+		case status == models.TransactionStatusFailed:
+			if f.Name() == models.TransactionStatusFailed {
+				if err = readDirAndAppend(f); err != nil {
 					return nil, err
 				}
-				for _, ff := range ffiles {
-					if !ff.IsDir() {
-						if strings.HasPrefix(ff.Name(), confFileName) {
-							transactions = append(transactions, t.parseTransactionFile(filepath.Join(t.TransactionDir, "failed", ff.Name())))
-						}
-					}
+			}
+		case status == models.TransactionStatusOutdated:
+			if f.Name() == models.TransactionStatusOutdated {
+				if err = readDirAndAppend(f); err != nil {
+					return nil, err
 				}
+			}
+		case f.IsDir() && status == "":
+			if err = readDirAndAppend(f); err != nil {
+				return nil, err
 			}
 		}
 	}
 
-	if !t.PersistentTransactions && status != "failed" {
+	if !t.PersistentTransactions && status != models.TransactionStatusFailed {
 		pt := t.TransactionClient.GetParserTransactions()
 		if len(pt) > 0 {
 			transactions = append(transactions, pt...)
@@ -394,11 +453,14 @@ func (t *Transaction) parseTransactions(status string) (*models.Transactions, er
 func (t *Transaction) parseTransactionFile(filePath string) *models.Transaction {
 	parts := strings.Split(filePath, string(filepath.Separator))
 	f := parts[len(parts)-1]
-	status := "in_progress"
+	status := models.TransactionStatusInProgress
 
 	if len(parts) > 1 {
-		if parts[len(parts)-2] == "failed" {
-			status = "failed"
+		switch parts[len(parts)-2] {
+		case models.TransactionStatusFailed:
+			status = models.TransactionStatusFailed
+		case models.TransactionStatusOutdated:
+			status = models.TransactionStatusOutdated
 		}
 	}
 
@@ -467,7 +529,12 @@ func (t *Transaction) GetTransactionFile(transactionID string) (string, error) {
 	// First find failed transaction file
 	transactionFileName := t.getTransactionFileName(transactionID)
 
-	fPath := filepath.Join(t.TransactionDir, "failed", transactionFileName)
+	var fPath string
+	fPath = filepath.Join(t.TransactionDir, models.TransactionStatusOutdated, transactionFileName)
+	if _, err := os.Stat(fPath); err == nil {
+		return fPath, nil
+	}
+	fPath = filepath.Join(t.TransactionDir, models.TransactionStatusFailed, transactionFileName)
 	if _, err := os.Stat(fPath); err == nil {
 		return fPath, nil
 	}
@@ -479,11 +546,11 @@ func (t *Transaction) GetTransactionFile(transactionID string) (string, error) {
 	return "", NewConfError(ErrTransactionDoesNotExist, fmt.Sprintf("transaction file %v does not exist", transactionID))
 }
 
-func (t *Transaction) getTransactionFileFailed(transactionID string) string {
+func (t *Transaction) getTransactionFile(transactionID, status string) string {
 	baseFileName := filepath.Base(filepath.Clean(t.ConfigurationFile))
 	transactionFileName := baseFileName + "." + transactionID
 
-	return filepath.Join(t.TransactionDir, "failed", transactionFileName)
+	return filepath.Join(t.TransactionDir, status, transactionFileName)
 }
 
 func (t *Transaction) getBackupFile(version int64) (string, error) {
@@ -498,7 +565,7 @@ func (t *Transaction) getBackupFile(version int64) (string, error) {
 	return "", NewConfError(ErrObjectDoesNotExist, fmt.Sprintf("backup file for version %v does not exist", version))
 }
 
-func (t *Transaction) failTransaction(transactionID string) {
+func (t *Transaction) failTransaction(transactionID string, txHandler transactionCleanerHandler) {
 	configFile, err := t.GetTransactionFile(transactionID)
 	if err != nil {
 		return
@@ -507,17 +574,28 @@ func (t *Transaction) failTransaction(transactionID string) {
 	if t.SkipFailedTransactions {
 		os.Remove(configFile)
 	} else {
-		t.writeFailedTransaction(transactionID, configFile)
+		txHandler(transactionID, configFile)
 	}
 	_ = t.TransactionClient.DeleteParser(transactionID)
 }
 
+func (t *Transaction) writeOutdatedTransaction(transactionID, configFile string) {
+	outdatedDir := filepath.Join(t.TransactionDir, models.TransactionStatusOutdated)
+	if _, err := os.Stat(outdatedDir); os.IsNotExist(err) {
+		_ = os.Mkdir(outdatedDir, 0755)
+	}
+	outdatedConfigFile := t.getTransactionFile(transactionID, models.TransactionStatusOutdated)
+	if err := moveFile(configFile, outdatedConfigFile); err != nil {
+		_ = os.Remove(configFile)
+	}
+}
+
 func (t *Transaction) writeFailedTransaction(transactionID, configFile string) {
-	failedDir := filepath.Join(t.TransactionDir, "failed")
+	failedDir := filepath.Join(t.TransactionDir, models.TransactionStatusFailed)
 	if _, err := os.Stat(failedDir); os.IsNotExist(err) {
 		_ = os.Mkdir(failedDir, 0755)
 	}
-	failedConfigFile := t.getTransactionFileFailed(transactionID)
+	failedConfigFile := t.getTransactionFile(transactionID, models.TransactionStatusFailed)
 	if err := moveFile(configFile, failedConfigFile); err != nil {
 		_ = os.Remove(configFile)
 	}
@@ -525,7 +603,7 @@ func (t *Transaction) writeFailedTransaction(transactionID, configFile string) {
 
 func (t *Transaction) getFailedTransactionVersion(transactionID string) (int64, error) {
 	fName := t.getTransactionFileName(transactionID)
-	failedDir := filepath.Join(t.TransactionDir, "failed")
+	failedDir := filepath.Join(t.TransactionDir, models.TransactionStatusFailed)
 	if _, err := os.Stat(failedDir); os.IsNotExist(err) {
 		return 0, NewConfError(ErrTransactionDoesNotExist, fmt.Sprintf("transaction %v not failed", transactionID))
 	}

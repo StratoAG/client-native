@@ -29,11 +29,11 @@ import (
 	"github.com/haproxytech/config-parser/v3/parsers"
 	stats "github.com/haproxytech/config-parser/v3/parsers/stats/settings"
 	"github.com/haproxytech/config-parser/v3/types"
-	"github.com/haproxytech/models/v2"
 	"github.com/kballard/go-shellquote"
 	"github.com/pkg/errors"
 
 	"github.com/haproxytech/client-native/v2/misc"
+	"github.com/haproxytech/client-native/v2/models"
 )
 
 const (
@@ -166,7 +166,7 @@ func (c *Client) GetParserTransactions() models.Transactions {
 		if err == nil {
 			t := &models.Transaction{
 				ID:      tID,
-				Status:  "in_progress",
+				Status:  models.TransactionStatusInProgress,
 				Version: v,
 			}
 			transactions = append(transactions, t)
@@ -249,7 +249,7 @@ func (c *Client) CommitParser(transactionID string) error {
 
 // InitTransactionParsers checks transactions and initializes parsers map with transactions in_progress
 func (c *Client) InitTransactionParsers() error {
-	transactions, err := c.GetTransactions("in_progress")
+	transactions, err := c.GetTransactions(models.TransactionStatusInProgress)
 	if err != nil {
 		return err
 	}
@@ -1123,7 +1123,7 @@ func (s *SectionParser) httpCheck() interface{} {
 			hc.ExclamationMark = h.ExclamationMark
 			hc.Match = h.Match
 			hc.Pattern = h.Pattern
-			hc.Type = &h.Type
+			hc.Type = misc.StringP(h.Type)
 		}
 		return hc
 	}
